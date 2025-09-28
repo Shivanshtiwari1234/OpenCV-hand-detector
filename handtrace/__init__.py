@@ -3,34 +3,36 @@ import cv2
 from handtrace.worker import hand_finger_counter
 import time
 import logging
+from collections import deque
 
+# Log everything to file, overwrite each run
 logging.basicConfig(
+    filename="hand_detection.log",
+    filemode="w",
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S"
 )
 
-def resize_frame_to_height(frame, target_height):
-    """Resize frame keeping aspect ratio."""
-    h, w = frame.shape[:2]
-    new_w = int(w * target_height / h)
-    return cv2.resize(frame, (new_w, target_height))
 
-
-def main():
+def main() -> None:
     logging.info("Starting main process")
 
     input_queue = Queue(maxsize=1)
     output_queue = Queue(maxsize=1)
 
-    # Start the worker process
-    worker_proc = Process(target=hand_finger_counter, args=(input_queue, output_queue))
+    worker_proc = Process(target=hand_finger_counter, args=(input_queue, output_queue), daemon=True)
     worker_proc.start()
     logging.info(f"Worker process started (PID: {worker_proc.pid})")
 
     cap = cv2.VideoCapture(0)
-    target_height = 480
+    fps_window = deque(maxlen=10)
     prev_time = time.time()
+
+    # Create a fixed-size, non-resizable window
+    cv2.namedWindow("Hand Detection", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Hand Detection", 640, 480)
+    cv2.setWindowProperty("Hand Detection", cv2.WND_PROP_AUTOSIZE, cv2.WINDOW_AUTOSIZE)
 
     try:
         while True:
@@ -40,23 +42,21 @@ def main():
                 break
 
             frame_flipped = cv2.flip(frame, 1)
-            frame_small = cv2.resize(frame_flipped, (320, 240))  # reduce load for worker
+            frame_small = cv2.resize(frame_flipped, (320, 240))
 
-            # Put frame into worker queue with timeout
             try:
-                input_queue.put(frame_small.copy(), timeout=0.1)
+                input_queue.put_nowait(frame_small.copy())
             except:
-                logging.warning("Input queue full, dropped frame")
+                logging.debug("Input queue full, dropped frame")
 
-            # Get processed frame from worker
             try:
                 if not output_queue.empty():
-                    processed_frame, mask, contour_visual, fingers = output_queue.get(timeout=0.1)
+                    processed_frame, _, _, fingers = output_queue.get_nowait()
 
-                    # Calculate FPS
                     curr_time = time.time()
-                    fps = 1 / (curr_time - prev_time)
+                    fps_window.append(1 / max(curr_time - prev_time, 1e-6))
                     prev_time = curr_time
+                    fps = sum(fps_window) / len(fps_window)
 
                     cv2.putText(
                         processed_frame,
@@ -68,23 +68,15 @@ def main():
                         2
                     )
 
-                    # Resize frames for dashboard
-                    processed_resized = resize_frame_to_height(processed_frame, target_height)
-                    mask_resized = resize_frame_to_height(mask, target_height)
-                    contour_resized = resize_frame_to_height(contour_visual, target_height)
-
-                    combined = cv2.hconcat([processed_resized, mask_resized, contour_resized])
-                    cv2.imshow("Hand Detection Dashboard", combined)
+                    cv2.imshow("Hand Detection", processed_frame)
 
             except Exception as e:
-                logging.warning(f"Output queue get exception: {e}")
+                logging.warning(f"Output queue exception: {e}")
 
-            # Exit on 'q' or ESC
             if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
                 logging.info("Exit key pressed")
                 break
 
-            # Monitor worker health
             if not worker_proc.is_alive():
                 logging.error("Worker process died unexpectedly")
                 break
@@ -93,12 +85,20 @@ def main():
         logging.error(f"Exception in main loop: {e}")
 
     finally:
-        logging.info("Stopping worker process")
+        logging.info("Cleaning up...")
         try:
-            input_queue.put(None, timeout=1)
+            input_queue.put_nowait(None)
         except:
             logging.warning("Failed to send exit signal to worker")
+
+        if worker_proc.is_alive():
+            worker_proc.terminate()
         worker_proc.join()
+
         cap.release()
         cv2.destroyAllWindows()
         logging.info("Main process terminated")
+
+
+if __name__ == "__main__":
+    main()
