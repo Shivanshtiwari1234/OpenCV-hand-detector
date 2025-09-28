@@ -1,0 +1,2 @@
+import handtrace
+handtrace.main()
